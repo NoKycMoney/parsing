@@ -1,6 +1,6 @@
 import hashlib
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 import requests
@@ -28,6 +28,20 @@ def _make_id(url: str, title: str) -> str:
   return hashlib.md5(raw).hexdigest()
 
 
+def _is_ad_detail_url(url: str) -> bool:
+  parsed = urlparse(url)
+  host = parsed.netloc.lower()
+  if "gohomenhatrang.com" not in host:
+    return False
+  path = parsed.path.rstrip("/")
+  if not path.startswith("/bai-dang/"):
+    return False
+  slug = path[len("/bai-dang/") :].strip("/")
+  if not slug or slug.startswith("page") or slug.startswith("trang"):
+    return False
+  return True
+
+
 def _extract_images(container, page_url: str) -> list[str]:
   images = []
   seen = set()
@@ -42,10 +56,18 @@ def _extract_images(container, page_url: str) -> list[str]:
     if not src:
       continue
     lower_src = src.lower()
-    if (
-        src.startswith("data:image")
-        or "logo" in lower_src
-        or "icon" in lower_src
+    if src.startswith("data:image") or any(
+        bad in lower_src
+        for bad in (
+            "logo",
+            "icon",
+            "avatar",
+            "user",
+            "profile",
+            "sprite",
+            "placeholder",
+            "svg",
+        )
     ):
       continue
 
@@ -59,7 +81,7 @@ def _extract_images(container, page_url: str) -> list[str]:
 
 def _extract_price(text: str) -> str:
   patterns = [
-      r"[\d\.,]+\s*(?:₫|VND|triệu|tr|tỷ|ty|million|mil)(?:\s*/\s*(?:tháng|month|mo|day|night|week|year))?",
+      r"[\d\.,]+\s*(?:triệu|tr|tỷ|ty|million|mil|₫|VND)(?:\s*/\s*(?:tháng|month|mo|day|night|week|year))?",
       r"(?:\$|USD\s*)\s*[\d\.,]+(?:\s*/\s*(?:tháng|month|mo|day|night|week|year))?",
       r"[\d\.,]+\s*(?:\$|USD)(?:\s*/\s*(?:tháng|month|mo|day|night|week|year))?",
   ]
@@ -70,90 +92,69 @@ def _extract_price(text: str) -> str:
   return "По запросу"
 
 
-def _parse_detail_images(ad_url: str) -> list[str]:
+def _parse_detail_data(ad_url: str) -> tuple[str, str, list[str]]:
   try:
     resp = requests.get(ad_url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
+
+    h1 = soup.find(["h1", "h2"])
+    title = _clean_text(h1.get_text(" ", strip=True)) if h1 else ""
+
     main = soup.find("main") or soup.find("article") or soup
-    return _extract_images(main, ad_url)
+    full_text = _clean_text(main.get_text(" ", strip=True))
+    price = _extract_price(full_text)
+    images = _extract_images(main, ad_url)
+    return title, price, images
   except Exception:
-    return []
+    return "", "По запросу", []
 
 
 def parse_gohome(url: str = BASE_URL, max_items: int = 25) -> list[dict]:
+  target_url = url
+  if target_url.rstrip("/") == "https://gohomenhatrang.com":
+    target_url = BASE_URL
+
   try:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = requests.get(target_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
   except Exception as e:
-    print(f"Ошибка загрузки {url}: {e}")
+    print(f"Ошибка загрузки {target_url}: {e}")
     return []
 
   soup = BeautifulSoup(resp.text, "html.parser")
   ads = []
   seen_urls = set()
 
-  candidates = soup.find_all(["article", "div", "li"], limit=350)
-  card_nodes = []
-  for node in candidates:
-    classes = " ".join(node.get("class", [])).lower()
-    if any(
-        k in classes
-        for k in ("listing", "property", "post", "card", "item", "bai-dang")
-    ):
-      link = node.find("a", href=True)
-      if link and node.find("img"):
-        card_nodes.append(node)
-
-  if not card_nodes:
-    for a in soup.find_all("a", href=True):
-      if a.find("img"):
-        parent = a.find_parent(["article", "div", "li"]) or a
-        card_nodes.append(parent)
-
-  for node in card_nodes:
+  for a in soup.find_all("a", href=True):
     if len(ads) >= max_items:
       break
 
-    link_tag = node.find("a", href=True)
-    if not link_tag:
+    ad_url = urljoin(target_url, a["href"].strip()).split("#")[0]
+    if not _is_ad_detail_url(ad_url) or ad_url in seen_urls:
       continue
 
-    ad_url = urljoin(url, link_tag["href"].strip())
-    if (
-        not ad_url.startswith("http")
-        or ad_url in seen_urls
-        or ad_url.rstrip("/") == url.rstrip("/")
-    ):
-      continue
-
-    lower_url = ad_url.lower()
-    if any(
-        skip in lower_url
-        for skip in (
-            "facebook.com",
-            "instagram.com",
-            "t.me/",
-            "mailto:",
-            "tel:",
-            "#",
-        )
-    ):
-      continue
-
-    heading = node.find(["h1", "h2", "h3", "h4"]) or link_tag
+    parent = a.find_parent(["article", "li", "div"]) or a
+    heading = parent.find(["h1", "h2", "h3", "h4"]) or a
     title = _clean_text(heading.get_text(" ", strip=True))
-    if not title or len(title) < 3:
-      title = (
-          _clean_text(link_tag.get("title", "")) or "Объявление GoHome Nha Trang"
-      )
+    if not title or len(title) < 4:
+      title = _clean_text(a.get("title", ""))
 
-    full_text = _clean_text(node.get_text(" ", strip=True))
+    full_text = _clean_text(parent.get_text(" ", strip=True))
     price = _extract_price(full_text)
-    images = _extract_images(node, ad_url)
+    images = _extract_images(parent, ad_url)
 
-    if not images:
-      images = _parse_detail_images(ad_url)
+    if not title or price == "По запросу" or not images:
+      det_title, det_price, det_images = _parse_detail_data(ad_url)
+      if not title and det_title:
+        title = det_title
+      if price == "По запросу" and det_price != "По запросу":
+        price = det_price
+      if not images and det_images:
+        images = det_images
+
+    if not title:
+      title = "Объявление GoHome Nha Trang"
 
     seen_urls.add(ad_url)
     ads.append({
