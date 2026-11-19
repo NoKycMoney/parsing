@@ -140,7 +140,7 @@ def _build_post_from_messages(channel: str, cat: str, msgs: list, title_ent: str
         "price": price[:80],
         "body": full_text[:1500],
         "url": post_url,
-        "images": [],
+        "images": photo_paths,
     }
 
 
