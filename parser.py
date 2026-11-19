@@ -40,8 +40,7 @@ BAD_IMG_TOKENS = (
 SKIP_PATH_TOKENS = (
     "/category", "/categories", "/tag", "/tags", "/author", "/login",
     "/register", "/contact", "/about", "/gioi-thieu", "/lien-he",
-    "/tin-tuc", "/news", "/blog", "/privacy", "/terms", "/search",
-    "/wp-content/uploads"
+    "/tin-tuc", "/news", "/blog", "/privacy", "/terms", "/search"
 )
 
 
@@ -60,6 +59,11 @@ def _normalize_url(url: str) -> str:
 
 def _make_id(ad_url: str) -> str:
     return hashlib.sha256(_normalize_url(ad_url).encode("utf-8")).hexdigest()
+
+
+def _make_fingerprint(title: str, price: str) -> str:
+    norm = f"{_clean_text(title).lower()}|{_clean_text(price).lower()}"
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
 def _is_same_allowed_domain(url: str) -> bool:
@@ -85,7 +89,6 @@ def _is_ad_detail_url(url: str, source_root: str) -> bool:
     if re.search(r"/(?:page|trang)/\d+$", lower_path):
         return False
 
-    # Для gohomenhatrang берём объявления строго из /bai-dang/<slug>
     if host == "gohomenhatrang.com":
         if not path.startswith("/bai-dang/"):
             return False
@@ -162,7 +165,7 @@ def _extract_price(text: str) -> str:
 
 def _parse_detail_page(ad_url: str) -> tuple[str, str, list[str]]:
     try:
-        resp = requests.get(ad_url, headers=HEADERS, timeout=18)
+        resp = requests.get(ad_url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -174,8 +177,7 @@ def _parse_detail_page(ad_url: str) -> tuple[str, str, list[str]]:
         price = _extract_price(full_text)
         images = _extract_images_from_soup(soup, ad_url)
         return title, price, images
-    except Exception as e:
-        print(f"Ошибка загрузки карточки {ad_url}: {e}")
+    except Exception:
         return "", "По запросу", []
 
 
@@ -198,7 +200,7 @@ def _find_next_page_url(soup: BeautifulSoup, current_url: str, visited_pages: se
     return None
 
 
-def _scrape_single_source(source_url: str, max_pages: int = 15, max_ads_per_source: int = 40) -> list[dict]:
+def _scrape_single_source(source_url: str, max_pages: int = 20) -> list[dict]:
     current_url = source_url
     visited_pages = set()
     ad_urls = []
@@ -206,12 +208,12 @@ def _scrape_single_source(source_url: str, max_pages: int = 15, max_ads_per_sour
     domain = urlparse(source_url).netloc.lower().removeprefix("www.")
 
     for _ in range(max_pages):
-        if not current_url or current_url in visited_pages or len(ad_urls) >= max_ads_per_source:
+        if not current_url or current_url in visited_pages:
             break
         visited_pages.add(current_url)
 
         try:
-            resp = requests.get(current_url, headers=HEADERS, timeout=20)
+            resp = requests.get(current_url, headers=HEADERS, timeout=10)
             if resp.status_code == 404 and current_url != source_url:
                 break
             resp.raise_for_status()
@@ -223,8 +225,6 @@ def _scrape_single_source(source_url: str, max_pages: int = 15, max_ads_per_sour
         added_on_page = 0
 
         for a in soup.find_all("a", href=True):
-            if len(ad_urls) >= max_ads_per_source:
-                break
             full_href = urljoin(current_url, a["href"].strip()).split("#")[0]
             if _is_ad_detail_url(full_href, source_url):
                 norm_url = _normalize_url(full_href)
@@ -245,6 +245,7 @@ def _scrape_single_source(source_url: str, max_pages: int = 15, max_ads_per_sour
             title = f"Объявление {domain}"
         results.append({
             "id": _make_id(ad_url),
+            "fp": _make_fingerprint(title, price),
             "source": domain,
             "title": title[:180],
             "price": price[:80],
@@ -255,7 +256,7 @@ def _scrape_single_source(source_url: str, max_pages: int = 15, max_ads_per_sour
     return results
 
 
-def parse_gohome(url: str | None = None, max_pages: int = 15) -> list[dict]:
+def parse_gohome(url: str | None = None, max_pages: int = 20) -> list[dict]:
     sources = [url] if url else SOURCES
     all_ads = []
     seen_ids = set()
