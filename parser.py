@@ -1,7 +1,6 @@
 import hashlib
 import re
-from urllib.parse import urljoin, urlparse
-
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from bs4 import BeautifulSoup
 import requests
 
@@ -23,15 +22,14 @@ def _clean_text(text: str) -> str:
   return re.sub(r"\s+", " ", text).strip()
 
 
-def _make_id(url: str, title: str) -> str:
-  raw = f"{url}|{title}".encode("utf-8")
-  return hashlib.md5(raw).hexdigest()
+def _make_id(url: str) -> str:
+  # ID привязан к URL объявления, чтобы новые посты определялись стабильно
+  return hashlib.md5(url.encode("utf-8")).hexdigest()
 
 
 def _is_ad_detail_url(url: str) -> bool:
   parsed = urlparse(url)
-  host = parsed.netloc.lower()
-  if "gohomenhatrang.com" not in host:
+  if "gohomenhatrang.com" not in parsed.netloc.lower():
     return False
   path = parsed.path.rstrip("/")
   if not path.startswith("/bai-dang/"):
@@ -110,66 +108,75 @@ def _parse_detail_data(ad_url: str) -> tuple[str, str, list[str]]:
     return "", "По запросу", []
 
 
-def parse_gohome(url: str = BASE_URL, max_items: int = 25) -> list[dict]:
-  target_url = url
-  if target_url.rstrip("/") == "https://gohomenhatrang.com":
-    target_url = BASE_URL
+def _page_url_with_num(base_url: str, page: int) -> str:
+  if page == 1:
+    return base_url
+  parsed = urlparse(base_url)
+  q = parse_qs(parsed.query)
+  q["page"] = [str(page)]
+  return urlunparse(parsed._replace(query=urlencode(q, doseq=True)))
 
-  try:
-    resp = requests.get(target_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-  except Exception as e:
-    print(f"Ошибка загрузки {target_url}: {e}")
-    return []
 
-  soup = BeautifulSoup(resp.text, "html.parser")
+def parse_gohome(url: str = BASE_URL, max_pages: int = 50) -> list[dict]:
+  root_url = BASE_URL if url.rstrip("/") == "https://gohomenhatrang.com" else url
+
   ads = []
   seen_urls = set()
 
-  for a in soup.find_all("a", href=True):
-    if len(ads) >= max_items:
+  for page in range(1, max_pages + 1):
+    page_url = _page_url_with_num(root_url, page)
+    try:
+      resp = requests.get(page_url, headers=HEADERS, timeout=20)
+      if resp.status_code == 404 and page > 1:
+        break
+      resp.raise_for_status()
+    except Exception as e:
+      print(f"Ошибка загрузки {page_url}: {e}")
       break
 
-    ad_url = urljoin(target_url, a["href"].strip()).split("#")[0]
-    if not _is_ad_detail_url(ad_url) or ad_url in seen_urls:
-      continue
+    soup = BeautifulSoup(resp.text, "html.parser")
+    new_links_on_page = 0
 
-    parent = a.find_parent(["article", "li", "div"]) or a
-    heading = parent.find(["h1", "h2", "h3", "h4"]) or a
-    title = _clean_text(heading.get_text(" ", strip=True))
-    if not title or len(title) < 4:
-      title = _clean_text(a.get("title", ""))
+    for a in soup.find_all("a", href=True):
+      ad_url = urljoin(page_url, a["href"].strip()).split("#")[0]
+      if not _is_ad_detail_url(ad_url) or ad_url in seen_urls:
+        continue
 
-    full_text = _clean_text(parent.get_text(" ", strip=True))
-    price = _extract_price(full_text)
-    images = _extract_images(parent, ad_url)
+      seen_urls.add(ad_url)
+      new_links_on_page += 1
 
-    if not title or price == "По запросу" or not images:
-      det_title, det_price, det_images = _parse_detail_data(ad_url)
-      if not title and det_title:
-        title = det_title
-      if price == "По запросу" and det_price != "По запросу":
-        price = det_price
-      if not images and det_images:
-        images = det_images
+      parent = a.find_parent(["article", "li", "div"]) or a
+      heading = parent.find(["h1", "h2", "h3", "h4"]) or a
+      title = _clean_text(heading.get_text(" ", strip=True))
+      if not title or len(title) < 4:
+        title = _clean_text(a.get("title", ""))
 
-    if not title:
-      title = "Объявление GoHome Nha Trang"
+      full_text = _clean_text(parent.get_text(" ", strip=True))
+      price = _extract_price(full_text)
+      images = _extract_images(parent, ad_url)
 
-    seen_urls.add(ad_url)
-    ads.append({
-        "id": _make_id(ad_url, title),
-        "title": title[:180],
-        "price": price[:80],
-        "url": ad_url,
-        "images": images,
-    })
+      if not title or price == "По запросу" or not images:
+        det_title, det_price, det_images = _parse_detail_data(ad_url)
+        if not title and det_title:
+          title = det_title
+        if price == "По запросу" and det_price != "По запросу":
+          price = det_price
+        if not images and det_images:
+          images = det_images
+
+      if not title:
+        title = "Объявление GoHome Nha Trang"
+
+      ads.append({
+          "id": _make_id(ad_url),
+          "title": title[:180],
+          "price": price[:80],
+          "url": ad_url,
+          "images": images,
+      })
+
+    # Если на странице > 1 нет ни одной новой ссылки — дальше объявлений нет
+    if page > 1 and new_links_on_page == 0:
+      break
 
   return ads
-
-
-if __name__ == "__main__":
-  items = parse_gohome()
-  print(f"Найдено объявлений: {len(items)}")
-  for item in items[:5]:
-    print(item)
