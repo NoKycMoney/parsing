@@ -298,22 +298,26 @@ def send_ad_to_group(ad: dict) -> bool:
         header += f"\nСсылка: {ad['url']}"
 
     full_message = f"{header}\n\n{body_text}".strip() if body_text else header
+    short_caption = full_message[:1024]
+    tail_message = full_message[1024:].strip()
 
     try:
         if len(images) > 1:
-            sent_album = _tg_send_media_group_files(target_chat, images, "")
+            sent_album = _tg_send_media_group_files(target_chat, images, short_caption)
             if not sent_album:
-                for p in images:
-                    _tg_send_photo_file(target_chat, p, None)
-            return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
+                for idx, p in enumerate(images):
+                    _tg_send_photo_file(target_chat, p, short_caption if idx == 0 else None)
+            if tail_message:
+                _tg_post_json("sendMessage", {"chat_id": target_chat, "text": tail_message[:4096]})
+            return True
 
         if len(images) == 1:
-            if len(full_message) <= 1024:
-                if _tg_send_photo_file(target_chat, images[0], full_message):
-                    return True
-            sent_photo = _tg_send_photo_file(target_chat, images[0], None)
-            msg_ok = _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
-            return sent_photo or msg_ok
+            sent_photo = _tg_send_photo_file(target_chat, images[0], short_caption)
+            if sent_photo:
+                if tail_message:
+                    _tg_post_json("sendMessage", {"chat_id": target_chat, "text": tail_message[:4096]})
+                return True
+            return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
 
         return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
     finally:
