@@ -245,17 +245,18 @@ def _tg_send_media_group_files(chat_id: str, paths: list[str], caption: str = ""
     try:
         files = {}
         media = []
+        cap = caption[:1024] if caption else ""
         for idx, p in enumerate(paths[:MAX_PHOTOS_PER_AD]):
             field = f"photo_{idx}"
             files[field] = open(p, "rb")
             item = {"type": "photo", "media": f"attach://{field}"}
-            if idx == 0 and caption:
-                item["caption"] = caption[:1024]
+            if idx == 0 and cap:
+                item["caption"] = cap
             media.append(item)
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMediaGroup",
-                data={"chat_id": chat_id, "media": json.dumps(media)},
+                data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)},
                 files=files,
                 timeout=30,
             )
@@ -305,8 +306,11 @@ def send_ad_to_group(ad: dict) -> bool:
         if len(images) > 1:
             sent_album = _tg_send_media_group_files(target_chat, images, short_caption)
             if not sent_album:
-                for idx, p in enumerate(images):
-                    _tg_send_photo_file(target_chat, p, short_caption if idx == 0 else None)
+                first_ok = _tg_send_photo_file(target_chat, images[0], short_caption)
+                for p in images[1:]:
+                    _tg_send_photo_file(target_chat, p, None)
+                if not first_ok:
+                    return False
             if tail_message:
                 _tg_post_json("sendMessage", {"chat_id": target_chat, "text": tail_message[:4096]})
             return True
