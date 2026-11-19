@@ -1,13 +1,25 @@
- import asyncio
+import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 import re
 import requests
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 import uvicorn
 from fastapi import FastAPI
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from parser import API_HASH, API_ID, TELETHON_SESSION, TG_SOURCES, _make_fingerprint, parse_tg_channel_async
+from parser import (
+    API_HASH,
+    API_ID,
+    ROUTE_MAP,
+    TELETHON_SESSION,
+    TG_SOURCES,
+    _clean_text,
+    _extract_price,
+    _make_fingerprint,
+    _make_id,
+    parse_tg_channel_async,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8987367122:AAF-bEMBGNSc8wdre76p6E_ooHoio1lypSE")
 DEFAULT_CHANNEL_ID = os.getenv("CHANNEL_ID", "@wwwparsing")
@@ -24,21 +36,22 @@ ROUTE_TARGETS = {
 
 DB_FILE = "sent_ads.json"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "2.5"))
+SEND_DELAY_SECONDS = float(os.getenv("SEND_DELAY_SECONDS", "2.0"))
 MAX_PHOTOS_PER_AD = int(os.getenv("MAX_PHOTOS_PER_AD", "10"))
-
-app = FastAPI(title="Telegram Channels Real Estate & Transport Parser")
+WATCHED_CHANNELS = [ch for _, ch in TG_SOURCES]
 
 _pg_conn = None
-_worker_task: asyncio.Task | None = None
+_listener_task: asyncio.Task | None = None
+_manual_task: asyncio.Task | None = None
+_send_lock = asyncio.Lock()
+_sent_cache: set[str] = set()
+
 _state = {
-    "running": False,
-    "current_source": None,
-    "sources_done": 0,
-    "sources_total": len(TG_SOURCES),
-    "last_found": 0,
-    "last_sent_new": 0,
-    "last_skipped": 0,
+    "listener_running": False,
+    "watched_channels": len(WATCHED_CHANNELS),
+    "last_channel": None,
+    "sent_new": 0,
+    "skipped": 0,
     "last_error": None,
 }
 
@@ -252,82 +265,156 @@ def send_ad_to_group(ad: dict) -> bool:
         _cleanup_files(images)
 
 
-async def _background_parse_and_send():
-    _state["running"] = True
-    _state["last_error"] = None
-    _state["sources_done"] = 0
-    _state["sources_total"] = len(TG_SOURCES)
-    _state["last_found"] = 0
-    _state["last_sent_new"] = 0
-    _state["last_skipped"] = 0
+async def _process_and_forward_ad(ad: dict):
+    global _sent_cache
+    async with _send_lock:
+        if not _sent_cache:
+            _sent_cache = load_sent()
 
-    if not TELETHON_SESSION:
-        _state["last_error"] = "TELETHON_SESSION не задана в переменных окружения"
-        _state["running"] = False
-        return
+        ad_id = ad["id"]
+        fp = ad.get("fp") or _make_fingerprint(ad.get("title", ""), ad.get("price", ""))
+        imgs = ad.get("images", [])
 
-    sent = load_sent()
-    seen_in_run = set()
-    total_found = 0
-    new_count = 0
-    skipped_count = 0
-
-    client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            _state["last_error"] = "Сессия Telethon не авторизована"
+        if ad_id in _sent_cache or fp in _sent_cache:
+            _cleanup_files(imgs)
+            _state["skipped"] += 1
             return
 
-        for cat, ch in TG_SOURCES:
-            _state["current_source"] = f"@{ch}"
-            items = await parse_tg_channel_async(client, ch, cat=cat, limit_per_channel=25)
-            total_found += len(items)
-            _state["last_found"] = total_found
+        _state["last_channel"] = ad.get("source")
+        ok = await asyncio.to_thread(send_ad_to_group, ad)
+        if ok:
+            save_sent_batch([(ad_id, ad["url"]), (fp, ad["url"])], _sent_cache)
+            _state["sent_new"] += 1
+            await asyncio.sleep(SEND_DELAY_SECONDS)
+        else:
+            _state["skipped"] += 1
 
-            for ad in items:
-                ad_id = ad["id"]
-                fp = ad.get("fp") or _make_fingerprint(ad.get("title", ""), ad.get("price", ""))
-                imgs = ad.get("images", [])
 
-                if ad_id in sent or fp in sent or ad_id in seen_in_run or fp in seen_in_run:
-                    _cleanup_files(imgs)
-                    skipped_count += 1
-                    _state["last_skipped"] = skipped_count
-                    continue
+async def _build_realtime_ad(client: TelegramClient, username: str, msgs: list) -> dict | None:
+    tmp_dir = "/tmp/tg_media"
+    os.makedirs(tmp_dir, exist_ok=True)
+    msgs = sorted(msgs, key=lambda m: m.id)
+    first_msg = msgs[0]
 
-                seen_in_run.add(ad_id)
-                seen_in_run.add(fp)
+    texts = []
+    downloaded = []
+    for m in msgs:
+        txt = _clean_text(getattr(m, "raw_text", "") or getattr(m, "message", "") or "")
+        if txt and txt not in texts:
+            texts.append(txt)
+        if getattr(m, "photo", None) and len(downloaded) < MAX_PHOTOS_PER_AD:
+            fpath = os.path.join(tmp_dir, f"{username}_{m.id}.jpg")
+            try:
+                saved = await client.download_media(m, file=fpath)
+                if saved and os.path.exists(saved):
+                    downloaded.append(saved)
+            except Exception:
+                pass
 
-                ok = await asyncio.to_thread(send_ad_to_group, ad)
-                if ok:
-                    save_sent_batch([(ad_id, ad["url"]), (fp, ad["url"])], sent)
-                    new_count += 1
-                    _state["last_sent_new"] = new_count
-                    await asyncio.sleep(SEND_DELAY_SECONDS)
-                else:
-                    skipped_count += 1
-                    _state["last_skipped"] = skipped_count
+    full_text = "\n".join(texts).strip()
+    if not full_text and not downloaded:
+        return None
 
-            _state["sources_done"] += 1
-            await asyncio.sleep(1.5)
-    except Exception as e:
-        _state["last_error"] = str(e)
-        print(f"Ошибка фонового цикла TG: {e}", flush=True)
-    finally:
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    title = lines[0][:180] if lines else f"Пост @{username}"
+    price = _extract_price(full_text)
+    route = ROUTE_MAP.get(username.lower(), "parsing_vn")
+    post_url = f"https://t.me/{username}/{first_msg.id}"
+
+    return {
+        "id": _make_id(username, first_msg.id),
+        "fp": _make_fingerprint(title, price),
+        "source": f"@{username}",
+        "route": route,
+        "title": title,
+        "price": price[:80],
+        "body": full_text[:1500],
+        "url": post_url,
+        "images": downloaded,
+    }
+
+
+async def _realtime_listener_loop():
+    global _sent_cache
+    if not TELETHON_SESSION:
+        _state["last_error"] = "TELETHON_SESSION не задана в переменных окружения"
+        return
+
+    _sent_cache = load_sent()
+
+    while True:
+        client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
         try:
-            await client.disconnect()
-        except Exception:
-            pass
-        _state["current_source"] = None
-        _state["running"] = False
+            await client.connect()
+            if not await client.is_user_authorized():
+                _state["last_error"] = "Сессия Telethon не авторизована"
+                _state["listener_running"] = False
+                return
+
+            @client.on(events.Album(chats=WATCHED_CHANNELS))
+            async def on_album(event):
+                try:
+                    chat = await event.get_chat()
+                    username = getattr(chat, "username", None)
+                    if not username or username.lower() not in ROUTE_MAP:
+                        return
+                    ad = await _build_realtime_ad(client, username, list(event.messages))
+                    if ad:
+                        await _process_and_forward_ad(ad)
+                except Exception as e:
+                    print(f"Ошибка обработки альбома: {e}", flush=True)
+
+            @client.on(events.NewMessage(chats=WATCHED_CHANNELS))
+            async def on_new_message(event):
+                try:
+                    if event.message.grouped_id:
+                        return
+                    chat = await event.get_chat()
+                    username = getattr(chat, "username", None)
+                    if not username or username.lower() not in ROUTE_MAP:
+                        return
+                    ad = await _build_realtime_ad(client, username, [event.message])
+                    if ad:
+                        await _process_and_forward_ad(ad)
+                except Exception as e:
+                    print(f"Ошибка обработки сообщения: {e}", flush=True)
+
+            _state["listener_running"] = True
+            _state["last_error"] = None
+            print(f"Слушатель запущен для {len(WATCHED_CHANNELS)} каналов", flush=True)
+            await client.run_until_disconnected()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            _state["listener_running"] = False
+            _state["last_error"] = str(e)
+            print(f"Переподключение слушателя через 10с после ошибки: {e}", flush=True)
+            await asyncio.sleep(10)
+        finally:
+            _state["listener_running"] = False
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    global _listener_task
+    _listener_task = asyncio.create_task(_realtime_listener_loop())
+    yield
+    if _listener_task and not _listener_task.done():
+        _listener_task.cancel()
+
+
+app = FastAPI(title="Realtime Telegram Channels Parser", lifespan=lifespan)
 
 
 @app.get("/")
 def home():
     return {
         "status": "running",
-        "mode": "telegram_channels",
+        "mode": "realtime_listener",
         "bot": "@goldantelope_asia_bot",
         "targets": SINGLE_TARGET or ROUTE_TARGETS,
         "max_photos_per_ad": MAX_PHOTOS_PER_AD,
@@ -335,14 +422,33 @@ def home():
     }
 
 
+async def _backfill_recent_messages():
+    if not TELETHON_SESSION:
+        return
+    client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return
+        for cat, ch in TG_SOURCES:
+            items = await parse_tg_channel_async(client, ch, cat=cat, limit_per_channel=10)
+            for ad in items:
+                await _process_and_forward_ad(ad)
+            await asyncio.sleep(1.0)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
 @app.api_route("/run-parse", methods=["GET", "POST"])
 async def run_parsing_cycle():
-    global _worker_task
-    if _worker_task is not None and not _worker_task.done():
+    global _manual_task
+    if _manual_task is not None and not _manual_task.done():
         return {"status": "already_running", "worker": _state}
-
-    _worker_task = asyncio.create_task(_background_parse_and_send())
-    return {"status": "started", "delay_seconds": SEND_DELAY_SECONDS}
+    _manual_task = asyncio.create_task(_backfill_recent_messages())
+    return {"status": "started_backfill", "worker": _state}
 
 
 if __name__ == "__main__":
