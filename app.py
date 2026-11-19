@@ -49,7 +49,9 @@ _sent_cache: set[str] = set()
 _state = {
     "listener_running": False,
     "watched_channels": len(WATCHED_CHANNELS),
+    "resolved_channels": 0,
     "last_channel": None,
+    "last_skip_reason": None,
     "sent_new": 0,
     "skipped": 0,
     "last_error": None,
@@ -76,6 +78,38 @@ def _resolve_target(route: str) -> str:
     if SINGLE_TARGET:
         return SINGLE_TARGET
     return ROUTE_TARGETS.get(route, DEFAULT_CHANNEL_ID)
+
+
+def _normalize_route_map(raw_map: dict) -> dict:
+    norm = {}
+    for k, v in (raw_map or {}).items():
+        key_str = str(k).strip().lstrip("@").lower()
+        if key_str:
+            norm[key_str] = v
+    return norm
+
+
+NORMALIZED_ROUTE_MAP = _normalize_route_map(ROUTE_MAP)
+
+
+def _match_route(chat, raw_chat_id) -> tuple[str | None, str]:
+    username = (getattr(chat, "username", None) or "").strip().lstrip("@").lower()
+    chat_id_str = str(raw_chat_id or getattr(chat, "id", "") or "").strip()
+
+    if username and username in NORMALIZED_ROUTE_MAP:
+        return username, NORMALIZED_ROUTE_MAP[username]
+    if chat_id_str and chat_id_str.lower() in NORMALIZED_ROUTE_MAP:
+        return chat_id_str, NORMALIZED_ROUTE_MAP[chat_id_str.lower()]
+
+    # Фолбэк по TG_SOURCES, если ROUTE_MAP не задан или задан иначе
+    for cat, src in TG_SOURCES:
+        src_clean = str(src).strip().lstrip("@").lower()
+        if (username and src_clean == username) or (chat_id_str and src_clean == chat_id_str.lower()):
+            label = username or chat_id_str
+            route = NORMALIZED_ROUTE_MAP.get(src_clean) or cat or "parsing_vn"
+            return label, route
+
+    return None, "parsing_vn"
 
 
 def _get_pg_conn():
@@ -278,6 +312,7 @@ async def _process_and_forward_ad(ad: dict):
         if ad_id in _sent_cache or fp in _sent_cache:
             _cleanup_files(imgs)
             _state["skipped"] += 1
+            _state["last_skip_reason"] = f"duplicate:{ad.get('source')}"
             return
 
         _state["last_channel"] = ad.get("source")
@@ -285,12 +320,15 @@ async def _process_and_forward_ad(ad: dict):
         if ok:
             save_sent_batch([(ad_id, ad["url"]), (fp, ad["url"])], _sent_cache)
             _state["sent_new"] += 1
+            _state["last_skip_reason"] = None
+            print(f"Отправлено из {ad.get('source')} -> {_resolve_target(ad.get('route', ''))}", flush=True)
             await asyncio.sleep(SEND_DELAY_SECONDS)
         else:
             _state["skipped"] += 1
+            _state["last_skip_reason"] = f"send_failed:{ad.get('source')}"
 
 
-async def _build_realtime_ad(client: TelegramClient, username: str, msgs: list) -> dict | None:
+async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msgs: list) -> dict | None:
     tmp_dir = "/tmp/tg_media"
     os.makedirs(tmp_dir, exist_ok=True)
     msgs = sorted(msgs, key=lambda m: m.id)
@@ -303,7 +341,7 @@ async def _build_realtime_ad(client: TelegramClient, username: str, msgs: list) 
         if txt and txt not in texts:
             texts.append(txt)
         if getattr(m, "photo", None) and len(downloaded) < MAX_PHOTOS_PER_AD:
-            fpath = os.path.join(tmp_dir, f"{username}_{m.id}.jpg")
+            fpath = os.path.join(tmp_dir, f"{label}_{m.id}.jpg")
             try:
                 saved = await client.download_media(m, file=fpath)
                 if saved and os.path.exists(saved):
@@ -316,15 +354,15 @@ async def _build_realtime_ad(client: TelegramClient, username: str, msgs: list) 
         return None
 
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-    title = lines[0][:180] if lines else f"Пост @{username}"
+    title = lines[0][:180] if lines else f"Пост {label}"
     price = _extract_price(full_text)
-    route = ROUTE_MAP.get(username.lower(), "parsing_vn")
-    post_url = f"https://t.me/{username}/{first_msg.id}"
+    source_label = f"@{label}" if not str(label).startswith(("@", "-")) else str(label)
+    post_url = f"https://t.me/{label}/{first_msg.id}" if not str(label).startswith("-") else ""
 
     return {
-        "id": _make_id(username, first_msg.id),
+        "id": _make_id(label, first_msg.id),
         "fp": _make_fingerprint(title, price),
-        "source": f"@{username}",
+        "source": source_label,
         "route": route,
         "title": title,
         "price": price[:80],
@@ -332,6 +370,17 @@ async def _build_realtime_ad(client: TelegramClient, username: str, msgs: list) 
         "url": post_url,
         "images": downloaded,
     }
+
+
+async def _resolve_valid_chats(client: TelegramClient, raw_chats: list) -> list:
+    valid = []
+    for ch in raw_chats:
+        try:
+            await client.get_input_entity(ch)
+            valid.append(ch)
+        except Exception as e:
+            print(f"Пропуск недоступного источника {ch}: {e}", flush=True)
+    return valid
 
 
 async def _realtime_listener_loop():
@@ -351,29 +400,33 @@ async def _realtime_listener_loop():
                 _state["listener_running"] = False
                 return
 
-            @client.on(events.Album(chats=WATCHED_CHANNELS))
+            active_chats = await _resolve_valid_chats(client, WATCHED_CHANNELS)
+            _state["resolved_channels"] = len(active_chats)
+            chats_filter = active_chats if active_chats else None
+
+            @client.on(events.Album(chats=chats_filter))
             async def on_album(event):
                 try:
                     chat = await event.get_chat()
-                    username = getattr(chat, "username", None)
-                    if not username or username.lower() not in ROUTE_MAP:
+                    label, route = _match_route(chat, event.chat_id)
+                    if not label:
                         return
-                    ad = await _build_realtime_ad(client, username, list(event.messages))
+                    ad = await _build_realtime_ad(client, label, route, list(event.messages))
                     if ad:
                         await _process_and_forward_ad(ad)
                 except Exception as e:
                     print(f"Ошибка обработки альбома: {e}", flush=True)
 
-            @client.on(events.NewMessage(chats=WATCHED_CHANNELS))
+            @client.on(events.NewMessage(chats=chats_filter))
             async def on_new_message(event):
                 try:
                     if event.message.grouped_id:
                         return
                     chat = await event.get_chat()
-                    username = getattr(chat, "username", None)
-                    if not username or username.lower() not in ROUTE_MAP:
+                    label, route = _match_route(chat, event.chat_id)
+                    if not label:
                         return
-                    ad = await _build_realtime_ad(client, username, [event.message])
+                    ad = await _build_realtime_ad(client, label, route, [event.message])
                     if ad:
                         await _process_and_forward_ad(ad)
                 except Exception as e:
@@ -381,7 +434,7 @@ async def _realtime_listener_loop():
 
             _state["listener_running"] = True
             _state["last_error"] = None
-            print(f"Слушатель запущен для {len(WATCHED_CHANNELS)} каналов", flush=True)
+            print(f"Слушатель запущен для {len(active_chats)}/{len(WATCHED_CHANNELS)} каналов", flush=True)
             await client.run_until_disconnected()
         except asyncio.CancelledError:
             break
@@ -431,9 +484,12 @@ async def _backfill_recent_messages():
         if not await client.is_user_authorized():
             return
         for cat, ch in TG_SOURCES:
-            items = await parse_tg_channel_async(client, ch, cat=cat, limit_per_channel=10)
-            for ad in items:
-                await _process_and_forward_ad(ad)
+            try:
+                items = await parse_tg_channel_async(client, ch, cat=cat, limit_per_channel=10)
+                for ad in items:
+                    await _process_and_forward_ad(ad)
+            except Exception as e:
+                print(f"Ошибка backfill для {ch}: {e}", flush=True)
             await asyncio.sleep(1.0)
     finally:
         try:
@@ -449,7 +505,3 @@ async def run_parsing_cycle():
         return {"status": "already_running", "worker": _state}
     _manual_task = asyncio.create_task(_backfill_recent_messages())
     return {"status": "started_backfill", "worker": _state}
-
-
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=7860)
