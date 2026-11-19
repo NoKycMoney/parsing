@@ -24,11 +24,11 @@ RE_VN = [
 ]
 BIKE_VN = [
     "bike_nhatrang", "motohub_nhatrang", "NhaTrang_moto_market", "RentBikeUniq",
-    "BK_rental", "nha_trang_rent", "danang_bike_rent",
+    "BK_rental", "nha_trang_rent",
     "bikerental1", "viet_sovet",
 ]
 RE_IN = [
-    "goa_arendaa", "goa_rent_house", "goaRentAll", "GoaRent", "myflats",
+    "goa_arendaa", "goa_rent_house", "goaRentAll", "myflats",
     "goa_siolim_realty", "HousingBangalore", "Arenda_Zhilya_Indiya",
     "goa_appart", "House_for_rent_Goa", "arendagoaarambol", "homegoa",
 ]
@@ -42,7 +42,7 @@ RE_TH = [
     "phuket_nedvizhimost_thailand", "phuketsk_for_rent", "phuket_rentas",
     "rentalsphuketonli", "rentbuyphuket", "Phuket_thailand05",
     "nedvizhimost_pattaya", "arenda_pattaya", "pattaya_realty_estate",
-    "HappyHomePattaya", "sea_bangkok", "Samui_for_you", "sea_phuket",
+    "sea_bangkok", "Samui_for_you", "sea_phuket",
     "realty_in_thailand", "nedvig_thailand", "thailand_nedvizhimost",
     "globe_nedvizhka_Thailand",
 ]
@@ -119,10 +119,11 @@ def _build_post_from_messages(channel: str, cat: str, msgs: list, title_ent: str
             out_path = os.path.join(tmp_dir, f"{channel}_{m.id}.jpg")
             photo_paths.append(out_path)
 
-    full_text = "\n".join(texts).strip()
-    if not full_text and not photo_paths:
+    # Пересылаем только посты с фото
+    if not photo_paths:
         return None
 
+    full_text = "\n".join(texts).strip()
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     title = lines[0][:180] if lines else f"Пост @{channel}"
     price = _extract_price(full_text)
@@ -138,7 +139,7 @@ def _build_post_from_messages(channel: str, cat: str, msgs: list, title_ent: str
         "channel_title": title_ent,
         "title": title,
         "price": price[:80],
-        "body": full_text[:1500],
+        "body": full_text[:4000],
         "url": post_url,
         "images": photo_paths,
     }
@@ -162,9 +163,8 @@ async def parse_tg_channel_async(
         async for msg in client.iter_messages(entity, limit=limit_per_channel):
             if isinstance(msg, MessageService):
                 continue
-            has_text = bool(_clean_text(getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""))
             has_photo = bool(getattr(msg, "photo", None))
-            if not has_text and not has_photo:
+            if not has_photo:
                 continue
 
             if msg.grouped_id:
@@ -194,6 +194,8 @@ async def parse_tg_channel_async(
                             downloaded.append(saved)
                     except Exception:
                         pass
+            if not downloaded:
+                continue
             item["images"] = downloaded
             results.append(item)
 
