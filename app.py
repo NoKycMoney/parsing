@@ -21,7 +21,7 @@ from parser import (
     parse_tg_channel_async,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8987367122:AAF-bEMBGNSc8wdre76p6E_ooHoio1lypSE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8987367122:AAH1zDpfmlC0xgmoiH8N3_HO3AIAznH7VW4")
 DEFAULT_CHANNEL_ID = os.getenv("CHANNEL_ID", "@wwwparsing")
 SINGLE_TARGET = os.getenv("SINGLE_TARGET", "").strip()
 ONLY_WITH_PHOTO = os.getenv("ONLY_WITH_PHOTO", "true").strip().lower() in {"1", "true", "yes", "on"}
