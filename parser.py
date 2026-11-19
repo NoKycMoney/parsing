@@ -1,48 +1,79 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import os
 import re
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-import requests
+from telethon import TelegramClient
+from telethon.errors import ChannelPrivateError, ChatAdminRequiredError, FloodWaitError
+from telethon.sessions import StringSession
+from telethon.tl.types import MessageService
 
-SOURCES = [
-    "https://nhatrangrenting.com/estate-contract/for-rent/",
-    "https://nhatrang4rent.com",
-    "https://nhatrangapt.com",
-    "https://nhatrangapartments.com",
-    "https://bds-mtland.com/p/",
-    "https://bds-mtland.com/nha-nha-trang",
-    "https://bds-mtland.com",
+API_ID = int(os.getenv("API_ID", "32726981"))
+API_HASH = os.getenv("API_HASH", "a532b3999366ded30608c2fe66a7621d")
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
+
+RE_VN = [
+    "phuquoc_rent_wt", "phyquocnedvigimost", "Viet_Life_Phu_Quoc_rent",
+    "nhatrangapartment", "tanrealtorgh", "viet_life_niachang", "nychang_arenda",
+    "rent_nha_trang", "nyachang_nedvizhimost", "nedvizimost_nhatrang",
+    "nhatrangforrent79", "NhatrangRentl", "arenda_v_nyachang", "rent_appart_nha",
+    "Arenda_Nyachang_Zhilye", "NhaTrang_rental", "realestatebythesea_1",
+    "NhaTrang_Luxury", "luckyhome_nhatrang", "rentnhatrang", "megasforrentnhatrang",
+    "viethome", "Vietnam_arenda", "huynhtruonq", "DaNangRentAFlat",
+    "danag_viet_life_rent", "Danang_House", "DaNangApartmentRent",
+    "danang_arenda", "arenda_v_danang", "HoChiMinhRentI", "hcmc_arenda",
+    "Hanoirentapartment", "HanoiRentl", "Hanoi_Rent", "PhuquocRentl",
+]
+BIKE_VN = [
+    "bike_nhatrang", "motohub_nhatrang", "NhaTrang_moto_market", "RentBikeUniq",
+    "BK_rental", "nha_trang_rent", "RentTwentyTwo22NhaTrang", "danang_bike_rent",
+    "bikerental1", "viet_sovet",
+]
+RE_IN = [
+    "goa_arendaa", "goa_rent_house", "goaRentAll", "GoaRent", "myflats",
+    "goa_siolim_realty", "HousingBangalore", "Arenda_Zhilya_Indiya",
+    "goa_appart", "House_for_rent_Goa", "arendagoaarambol", "homegoa",
+]
+RE_INDO = [
+    "CHAT_BALI_REAL_ESTATE", "bali_appart", "onerealestatebali", "bali_arenda1",
+    "estetico_estate", "kvartira_bali", "rentbali_villa",
+]
+RE_TH = [
+    "arenda_phukets", "THAILAND_REAL_ESTATE_PHUKET", "housephuket",
+    "arenda_phuket_thailand", "phuket_nedvizhimost_rent", "phuketsk_arenda",
+    "phuket_nedvizhimost_thailand", "phuketsk_for_rent", "phuket_rentas",
+    "rentalsphuketonli", "rentbuyphuket", "Phuket_thailand05",
+    "nedvizhimost_pattaya", "arenda_pattaya", "pattaya_realty_estate",
+    "HappyHomePattaya", "sea_bangkok", "Samui_for_you", "sea_phuket",
+    "realty_in_thailand", "nedvig_thailand", "thailand_nedvizhimost",
+    "globe_nedvizhka_Thailand",
+]
+BIKE_TH = [
+    "arenda_thailandd", "thailand_market", "rental_service_thailand",
+    "samui_arenda2", "motorrenta", "nashi_phuket_auto", "thailand_drive",
+    "PKHUKET_BAYKOV", "Pattaya_Arenda_ru", "pattaya_happy_auto",
+    "pattaya_arenda", "pattayamoto",
 ]
 
-ALLOWED_DOMAINS = (
-    "nhatrangrenting.com",
-    "nhatrang4rent.com",
-    "nhatrangapt.com",
-    "nhatrangapartments.com",
-    "bds-mtland.com",
-)
+ROUTE_MAP = {}
+for ch in RE_VN:
+    ROUTE_MAP[ch.lower()] = "parsing_vn"
+for ch in BIKE_VN:
+    ROUTE_MAP[ch.lower()] = "bikeparsing_vn"
+for ch in RE_IN:
+    ROUTE_MAP[ch.lower()] = "parsing_in"
+for ch in RE_INDO:
+    ROUTE_MAP[ch.lower()] = "parsing_indo"
+for ch in RE_TH:
+    ROUTE_MAP[ch.lower()] = "parsing_th"
+for ch in BIKE_TH:
+    ROUTE_MAP[ch.lower()] = "bikeparsing_th"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7,ru;q=0.6",
-}
-
-BAD_IMG_TOKENS = (
-    "logo", "icon", "avatar", "user", "profile", "sprite",
-    "placeholder", "svg", "banner", "favicon", "no-image", "flag",
-    "zalo", "whatsapp", "viber", "telegram", "facebook", "youtube", "twitter"
-)
-
-SKIP_PATH_TOKENS = (
-    "/category", "/categories", "/tag", "/tags", "/author", "/login",
-    "/register", "/contact", "/about", "/gioi-thieu", "/lien-he",
-    "/tin-tuc", "/news", "/blog", "/privacy", "/terms", "/search",
-    "/estate-contract/"
+TG_SOURCES = (
+    [("real_estate", c) for c in RE_VN]
+    + [("transport", c) for c in BIKE_VN]
+    + [("real_estate", c) for c in RE_IN]
+    + [("real_estate", c) for c in RE_INDO]
+    + [("real_estate", c) for c in RE_TH]
+    + [("transport", c) for c in BIKE_TH]
 )
 
 
@@ -52,15 +83,9 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
-    host = parsed.netloc.lower().removeprefix("www.")
-    clean_path = parsed.path.rstrip("/") or "/"
-    return f"https://{host}{clean_path}"
-
-
-def _make_id(ad_url: str) -> str:
-    return hashlib.sha256(_normalize_url(ad_url).encode("utf-8")).hexdigest()
+def _make_id(channel: str, msg_id: int) -> str:
+    raw = f"{channel.lower().lstrip('@')}:{msg_id}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _make_fingerprint(title: str, price: str) -> str:
@@ -68,103 +93,11 @@ def _make_fingerprint(title: str, price: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
-def _is_same_allowed_domain(url: str) -> bool:
-    host = urlparse(url).netloc.lower().removeprefix("www.")
-    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
-
-
-def _is_ad_detail_url(url: str, source_root: str) -> bool:
-    parsed = urlparse(url)
-    if not _is_same_allowed_domain(url):
-        return False
-
-    host = parsed.netloc.lower().removeprefix("www.")
-    src_path = urlparse(source_root).path.rstrip("/")
-    path = parsed.path.rstrip("/")
-
-    if not path or path == "/" or path == src_path:
-        return False
-
-    lower_path = path.lower()
-    if any(tok in lower_path for tok in SKIP_PATH_TOKENS):
-        return False
-    if re.search(r"/(?:page|trang)/\d+$", lower_path):
-        return False
-
-    if host == "nhatrangrenting.com":
-        return "/properties/" in lower_path
-
-    if host == "bds-mtland.com":
-        if lower_path.startswith("/p/"):
-            slug = path[3:].strip("/")
-            return bool(slug)
-        if "/p/" in lower_path:
-            return True
-        segments = [s for s in path.split("/") if s]
-        if len(segments) == 1 and segments[0].lower() in (
-            "nha-nha-trang", "dat-nha-trang", "can-ho-nha-trang", "san-pham"
-        ):
-            return False
-        return len(segments) >= 1 and (len(segments[-1]) > 12 or re.search(r"\.\d+$", segments[-1]))
-
-    segments = [s for s in path.split("/") if s]
-    if len(segments) == 1 and segments[0].lower() in (
-        "en", "vi", "ru", "ko", "zh", "rent", "sale", "sales", "buy",
-        "cho-thue", "ban", "nha-dat", "can-ho", "apartments", "apartment",
-        "buildings", "hot-news", "projects", "du-an"
-    ):
-        return False
-
-    last_seg = segments[-1]
-    if len(last_seg) < 5 and not re.search(r"\d", last_seg):
-        return False
-
-    return True
-
-
-def _extract_images_from_soup(soup: BeautifulSoup, page_url: str) -> list[str]:
-    scope = soup.find("main") or soup.find("article") or soup
-    images = []
-    seen = set()
-
-    for img in scope.find_all("img"):
-        if img.find_parent(["header", "footer", "nav", "aside"]):
-            continue
-
-        candidates = []
-        for attr in ("data-src", "data-lazy-src", "data-original", "data-large", "src"):
-            val = img.get(attr)
-            if val:
-                candidates.append(val.strip())
-
-        srcset = img.get("srcset", "")
-        if srcset:
-            parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
-            if parts:
-                candidates.append(parts[-1])
-
-        chosen = None
-        for src in candidates:
-            if not src or src.startswith("data:image"):
-                continue
-            lower_src = src.lower()
-            if any(bad in lower_src for bad in BAD_IMG_TOKENS):
-                continue
-            chosen = urljoin(page_url, src)
-            break
-
-        if chosen and chosen not in seen:
-            seen.add(chosen)
-            images.append(chosen)
-
-    return images[:10]
-
-
 def _extract_price(text: str) -> str:
     patterns = [
-        r"(?:\$|USD\s*)\s*[\d\.,]+(?:\s*/\s*(?:mo|month|tháng|day|night|week|year))?",
-        r"[\d\.,]+\s*(?:\$|USD)(?:\s*/\s*(?:mo|month|tháng|day|night|week|year))?",
-        r"[\d\.,]+\s*(?:triệu|tr|tỷ|ty|million|mil|₫|VND)(?:\s*/\s*(?:tháng|month|mo|day|night|week|year))?",
+        r"(?:\$|USD\s*)\s*[\d\.,]+(?:\s*/\s*(?:mo|month|tháng|day|night|week|year|мес|сут|день))?",
+        r"[\d\.,]+\s*(?:\$|USD)(?:\s*/\s*(?:mo|month|tháng|day|night|week|year|мес|сут|день))?",
+        r"[\d\.,]+\s*(?:triệu|tr|tỷ|ty|million|mil|₫|VND|руб|₽)(?:\s*/\s*(?:tháng|month|mo|day|night|week|year|мес|сут|день))?",
     ]
     for pat in patterns:
         match = re.search(pat, text, flags=re.IGNORECASE)
@@ -173,122 +106,102 @@ def _extract_price(text: str) -> str:
     return "По запросу"
 
 
-def _parse_detail_page(ad_url: str, domain: str) -> dict:
-    title = f"Объявление {domain}"
-    price = "По запросу"
-    images = []
-    try:
-        resp = requests.get(ad_url, headers=HEADERS, timeout=6)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+def _build_post_from_messages(channel: str, cat: str, msgs: list, title_ent: str, tmp_dir: str) -> dict | None:
+    texts = []
+    photo_paths = []
+    first_msg = msgs[0]
+    for m in msgs:
+        txt = _clean_text(getattr(m, "raw_text", "") or getattr(m, "message", "") or "")
+        if txt and txt not in texts:
+            texts.append(txt)
+        if getattr(m, "photo", None) and len(photo_paths) < 10:
+            os.makedirs(tmp_dir, exist_ok=True)
+            out_path = os.path.join(tmp_dir, f"{channel}_{m.id}.jpg")
+            photo_paths.append(out_path)
 
-        h1 = soup.find("h1") or soup.find("h2")
-        if h1:
-            t = _clean_text(h1.get_text(" ", strip=True))
-            if t:
-                title = t
+    full_text = "\n".join(texts).strip()
+    if not full_text and not photo_paths:
+        return None
 
-        main = soup.find("main") or soup.find("article") or soup
-        full_text = _clean_text(main.get_text(" ", strip=True))
-        price = _extract_price(full_text)
-        images = _extract_images_from_soup(soup, ad_url)
-    except Exception:
-        pass
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    title = lines[0][:180] if lines else f"Пост @{channel}"
+    price = _extract_price(full_text)
+    route = ROUTE_MAP.get(channel.lower(), "parsing_vn")
+    post_url = f"https://t.me/{channel}/{first_msg.id}"
 
     return {
-        "id": _make_id(ad_url),
+        "id": _make_id(channel, first_msg.id),
         "fp": _make_fingerprint(title, price),
-        "source": domain,
-        "title": title[:180],
+        "source": f"@{channel}",
+        "category": cat,
+        "route": route,
+        "channel_title": title_ent,
+        "title": title,
         "price": price[:80],
-        "url": ad_url,
-        "images": images,
+        "body": full_text[:1500],
+        "url": post_url,
+        "images": [],
     }
 
 
-def _find_next_page_url(soup: BeautifulSoup, current_url: str, visited_pages: set[str]) -> str | None:
-    for a in soup.find_all("a", href=True):
-        rel = " ".join(a.get("rel", [])).lower()
-        href = urljoin(current_url, a["href"].strip()).split("#")[0]
-        if not _is_same_allowed_domain(href):
-            continue
-        if href in visited_pages or href == current_url:
-            continue
-
-        text = _clean_text(a.get_text(" ", strip=True)).lower()
-        if "next" in rel or text in ("›", "»", "next", "tiếp", "sau", "trang sau"):
-            return href
-
-        if re.search(r"(?:[?&](?:page|trang|paged|p)=\d+|/(?:page|trang)/\d+)", href, flags=re.IGNORECASE):
-            return href
-
-    return None
-
-
-def parse_source(source_url: str, max_pages: int = 5, max_ads: int = 20) -> list[dict]:
-    current_url = source_url
-    visited_pages = set()
-    ad_urls = []
-    seen_ad_urls = set()
-    domain = urlparse(source_url).netloc.lower().removeprefix("www.")
-
-    for _ in range(max_pages):
-        if not current_url or current_url in visited_pages or len(ad_urls) >= max_ads:
-            break
-        visited_pages.add(current_url)
-
-        try:
-            resp = requests.get(current_url, headers=HEADERS, timeout=7)
-            if resp.status_code == 404 and current_url != source_url:
-                break
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"Ошибка загрузки {current_url}: {e}")
-            break
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        added_on_page = 0
-
-        for a in soup.find_all("a", href=True):
-            if len(ad_urls) >= max_ads:
-                break
-            full_href = urljoin(current_url, a["href"].strip()).split("#")[0]
-            if _is_ad_detail_url(full_href, source_url):
-                norm_url = _normalize_url(full_href)
-                if norm_url not in seen_ad_urls:
-                    seen_ad_urls.add(norm_url)
-                    ad_urls.append(norm_url)
-                    added_on_page += 1
-
-        next_url = _find_next_page_url(soup, current_url, visited_pages)
-        if not next_url and added_on_page == 0:
-            break
-        current_url = next_url
-
-    if not ad_urls:
-        return []
-
+async def parse_tg_channel_async(
+    client: TelegramClient,
+    channel: str,
+    cat: str = "real_estate",
+    limit_per_channel: int = 25,
+    tmp_dir: str = "/tmp/tg_media",
+) -> list[dict]:
     results = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(_parse_detail_page, u, domain) for u in ad_urls]
-        for fut in as_completed(futures):
-            try:
-                results.append(fut.result())
-            except Exception:
-                pass
+    try:
+        entity = await client.get_entity(channel)
+        ent_title = getattr(entity, "title", channel)
+
+        grouped: dict[int, list] = {}
+        standalone: list = []
+
+        async for msg in client.iter_messages(entity, limit=limit_per_channel):
+            if isinstance(msg, MessageService):
+                continue
+            has_text = bool(_clean_text(getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""))
+            has_photo = bool(getattr(msg, "photo", None))
+            if not has_text and not has_photo:
+                continue
+
+            if msg.grouped_id:
+                grouped.setdefault(msg.grouped_id, []).append(msg)
+            else:
+                standalone.append([msg])
+
+        batches = []
+        for g_msgs in grouped.values():
+            g_msgs.sort(key=lambda x: x.id)
+            batches.append(g_msgs)
+        batches.extend(standalone)
+        batches.sort(key=lambda b: b[0].id, reverse=True)
+
+        os.makedirs(tmp_dir, exist_ok=True)
+        for batch in batches:
+            item = _build_post_from_messages(channel, cat, batch, ent_title, tmp_dir)
+            if not item:
+                continue
+            downloaded = []
+            for m in batch:
+                if getattr(m, "photo", None) and len(downloaded) < 10:
+                    fpath = os.path.join(tmp_dir, f"{channel}_{m.id}.jpg")
+                    try:
+                        saved = await client.download_media(m, file=fpath)
+                        if saved and os.path.exists(saved):
+                            downloaded.append(saved)
+                    except Exception:
+                        pass
+            item["images"] = downloaded
+            results.append(item)
+
+    except (ChatAdminRequiredError, ChannelPrivateError) as e:
+        print(f"@{channel}: нет доступа ({type(e).__name__})", flush=True)
+    except FloodWaitError as e:
+        print(f"@{channel}: FloodWait {e.seconds}s", flush=True)
+    except Exception as e:
+        print(f"@{channel}: ошибка {type(e).__name__}: {e}", flush=True)
+
     return results
-
-
-def parse_gohome(url: str | None = None, max_pages: int = 5) -> list[dict]:
-    sources = [url] if url else SOURCES
-    all_ads = []
-    seen_ids = set()
-
-    for src in sources:
-        items = parse_source(src, max_pages=max_pages)
-        for item in items:
-            if item["id"] not in seen_ids:
-                seen_ids.add(item["id"])
-                all_ads.append(item)
-
-    return all_ads
