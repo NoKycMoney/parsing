@@ -70,8 +70,32 @@ _EMOJI_RE = re.compile(
 def _strip_icons(text: str) -> str:
     if not text:
         return ""
-    cleaned = _EMOJI_RE.sub("", text)
-    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return _EMOJI_RE.sub("", text)
+
+
+def _format_post_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _strip_icons(text)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in cleaned.splitlines()]
+    compact = []
+    prev_empty = False
+    for ln in lines:
+        if not ln:
+            if not prev_empty:
+                compact.append("")
+            prev_empty = True
+        else:
+            compact.append(ln)
+            prev_empty = False
+    return "\n".join(compact).strip()
+
+
+def _clean_multiline(text: str) -> str:
+    if not text:
+        return ""
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
+    return "\n".join(ln for ln in lines if ln != "").strip()
 
 
 def _resolve_target(route: str) -> str:
@@ -101,7 +125,6 @@ def _match_route(chat, raw_chat_id) -> tuple[str | None, str]:
     if chat_id_str and chat_id_str.lower() in NORMALIZED_ROUTE_MAP:
         return chat_id_str, NORMALIZED_ROUTE_MAP[chat_id_str.lower()]
 
-    # Фолбэк по TG_SOURCES, если ROUTE_MAP не задан или задан иначе
     for cat, src in TG_SOURCES:
         src_clean = str(src).strip().lstrip("@").lower()
         if (username and src_clean == username) or (chat_id_str and src_clean == chat_id_str.lower()):
@@ -216,7 +239,7 @@ def _tg_send_photo_file(chat_id: str, path: str, caption: str | None = None) -> 
         return False
 
 
-def _tg_send_media_group_files(chat_id: str, paths: list[str], caption: str) -> bool:
+def _tg_send_media_group_files(chat_id: str, paths: list[str], caption: str = "") -> bool:
     try:
         files = {}
         media = []
@@ -224,7 +247,7 @@ def _tg_send_media_group_files(chat_id: str, paths: list[str], caption: str) -> 
             field = f"photo_{idx}"
             files[field] = open(p, "rb")
             item = {"type": "photo", "media": f"attach://{field}"}
-            if idx == 0:
+            if idx == 0 and caption:
                 item["caption"] = caption[:1024]
             media.append(item)
         try:
@@ -261,40 +284,33 @@ def _cleanup_files(paths: list[str]):
 
 def send_ad_to_group(ad: dict) -> bool:
     target_chat = _resolve_target(ad.get("route", ""))
-    title = _strip_icons(ad.get("title", ""))
-    price = _strip_icons(ad.get("price", ""))
-    body_preview = _strip_icons(ad.get("body", ""))
-    if len(body_preview) > 700:
-        body_preview = body_preview[:697] + "..."
+    raw_body = ad.get("body") or ad.get("title") or ""
+    body_text = _format_post_text(raw_body)
 
-    caption = (
-        f"Источник: {ad['source']}\n"
-        f"Ссылка: {ad['url']}\n\n"
-        f"{title}\n"
-        f"Цена: {price}\n\n"
-        f"{body_preview}"
-    ).strip()[:1024]
+    header = f"Источник: {ad['source']}"
+    if ad.get("url"):
+        header += f"\nСсылка: {ad['url']}"
 
+    full_message = f"{header}\n\n{body_text}".strip() if body_text else header
     images = [p for p in ad.get("images", []) if p and os.path.exists(p)][:MAX_PHOTOS_PER_AD]
 
     try:
         if len(images) > 1:
-            if _tg_send_media_group_files(target_chat, images, caption):
-                return True
-            sent_any = False
-            for idx, p in enumerate(images):
-                if _tg_send_photo_file(target_chat, p, caption if idx == 0 else None):
-                    sent_any = True
-            if sent_any:
-                return True
-            return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": caption})
+            sent_album = _tg_send_media_group_files(target_chat, images, "")
+            if not sent_album:
+                for p in images:
+                    _tg_send_photo_file(target_chat, p, None)
+            return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
 
         if len(images) == 1:
-            if _tg_send_photo_file(target_chat, images[0], caption):
-                return True
-            return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": caption})
+            if len(full_message) <= 1024:
+                if _tg_send_photo_file(target_chat, images[0], full_message):
+                    return True
+            sent_photo = _tg_send_photo_file(target_chat, images[0], None)
+            msg_ok = _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
+            return sent_photo or msg_ok
 
-        return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": caption})
+        return _tg_post_json("sendMessage", {"chat_id": target_chat, "text": full_message[:4096]})
     finally:
         _cleanup_files(images)
 
@@ -337,7 +353,8 @@ async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msg
     texts = []
     downloaded = []
     for m in msgs:
-        txt = _clean_text(getattr(m, "raw_text", "") or getattr(m, "message", "") or "")
+        raw_m = getattr(m, "raw_text", "") or getattr(m, "message", "") or ""
+        txt = _clean_multiline(raw_m)
         if txt and txt not in texts:
             texts.append(txt)
         if getattr(m, "photo", None) and len(downloaded) < MAX_PHOTOS_PER_AD:
@@ -349,13 +366,13 @@ async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msg
             except Exception:
                 pass
 
-    full_text = "\n".join(texts).strip()
+    full_text = "\n\n".join(texts).strip()
     if not full_text and not downloaded:
         return None
 
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-    title = lines[0][:180] if lines else f"Пост {label}"
-    price = _extract_price(full_text)
+    title = _clean_text(lines[0])[:180] if lines else f"Пост {label}"
+    price = _extract_price(_clean_text(full_text))
     source_label = f"@{label}" if not str(label).startswith(("@", "-")) else str(label)
     post_url = f"https://t.me/{label}/{first_msg.id}" if not str(label).startswith("-") else ""
 
@@ -366,7 +383,7 @@ async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msg
         "route": route,
         "title": title,
         "price": price[:80],
-        "body": full_text[:1500],
+        "body": full_text[:4000],
         "url": post_url,
         "images": downloaded,
     }
@@ -505,3 +522,8 @@ async def run_parsing_cycle():
         return {"status": "already_running", "worker": _state}
     _manual_task = asyncio.create_task(_backfill_recent_messages())
     return {"status": "started_backfill", "worker": _state}
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "7860"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
