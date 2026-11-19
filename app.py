@@ -24,6 +24,7 @@ from parser import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8987367122:AAF-bEMBGNSc8wdre76p6E_ooHoio1lypSE")
 DEFAULT_CHANNEL_ID = os.getenv("CHANNEL_ID", "@wwwparsing")
 SINGLE_TARGET = os.getenv("SINGLE_TARGET", "").strip()
+ONLY_WITH_PHOTO = os.getenv("ONLY_WITH_PHOTO", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 ROUTE_TARGETS = {
     "parsing_vn": os.getenv("TARGET_VN", "@parsing_vn"),
@@ -50,6 +51,7 @@ _state = {
     "listener_running": False,
     "watched_channels": len(WATCHED_CHANNELS),
     "resolved_channels": 0,
+    "only_with_photo": ONLY_WITH_PHOTO,
     "last_channel": None,
     "last_skip_reason": None,
     "sent_new": 0,
@@ -283,6 +285,10 @@ def _cleanup_files(paths: list[str]):
 
 
 def send_ad_to_group(ad: dict) -> bool:
+    images = [p for p in ad.get("images", []) if p and os.path.exists(p)][:MAX_PHOTOS_PER_AD]
+    if ONLY_WITH_PHOTO and not images:
+        return False
+
     target_chat = _resolve_target(ad.get("route", ""))
     raw_body = ad.get("body") or ad.get("title") or ""
     body_text = _format_post_text(raw_body)
@@ -292,7 +298,6 @@ def send_ad_to_group(ad: dict) -> bool:
         header += f"\nСсылка: {ad['url']}"
 
     full_message = f"{header}\n\n{body_text}".strip() if body_text else header
-    images = [p for p in ad.get("images", []) if p and os.path.exists(p)][:MAX_PHOTOS_PER_AD]
 
     try:
         if len(images) > 1:
@@ -325,6 +330,11 @@ async def _process_and_forward_ad(ad: dict):
         fp = ad.get("fp") or _make_fingerprint(ad.get("title", ""), ad.get("price", ""))
         imgs = ad.get("images", [])
 
+        if ONLY_WITH_PHOTO and not imgs:
+            _state["skipped"] += 1
+            _state["last_skip_reason"] = f"no_photo:{ad.get('source')}"
+            return
+
         if ad_id in _sent_cache or fp in _sent_cache:
             _cleanup_files(imgs)
             _state["skipped"] += 1
@@ -345,6 +355,10 @@ async def _process_and_forward_ad(ad: dict):
 
 
 async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msgs: list) -> dict | None:
+    has_any_photo = any(bool(getattr(m, "photo", None)) for m in msgs)
+    if ONLY_WITH_PHOTO and not has_any_photo:
+        return None
+
     tmp_dir = "/tmp/tg_media"
     os.makedirs(tmp_dir, exist_ok=True)
     msgs = sorted(msgs, key=lambda m: m.id)
@@ -366,10 +380,10 @@ async def _build_realtime_ad(client: TelegramClient, label: str, route: str, msg
             except Exception:
                 pass
 
-    full_text = "\n\n".join(texts).strip()
-    if not full_text and not downloaded:
+    if ONLY_WITH_PHOTO and not downloaded:
         return None
 
+    full_text = "\n\n".join(texts).strip()
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     title = _clean_text(lines[0])[:180] if lines else f"Пост {label}"
     price = _extract_price(_clean_text(full_text))
@@ -424,6 +438,8 @@ async def _realtime_listener_loop():
             @client.on(events.Album(chats=chats_filter))
             async def on_album(event):
                 try:
+                    if ONLY_WITH_PHOTO and not any(bool(getattr(m, "photo", None)) for m in event.messages):
+                        return
                     chat = await event.get_chat()
                     label, route = _match_route(chat, event.chat_id)
                     if not label:
@@ -438,6 +454,8 @@ async def _realtime_listener_loop():
             async def on_new_message(event):
                 try:
                     if event.message.grouped_id:
+                        return
+                    if ONLY_WITH_PHOTO and not getattr(event.message, "photo", None):
                         return
                     chat = await event.get_chat()
                     label, route = _match_route(chat, event.chat_id)
