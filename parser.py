@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import re
 from urllib.parse import urljoin, urlparse
@@ -5,18 +6,18 @@ from bs4 import BeautifulSoup
 import requests
 
 SOURCES = [
-    "https://gohomenhatrang.com/bai-dang",
+    "https://nhatrangrenting.com/estate-contract/for-rent/",
     "https://nhatrang4rent.com",
-    "https://nhatrangrenting.com",
     "https://nhatrangapt.com",
     "https://nhatrangapartments.com",
+    "https://bds-mtland.com/p/",
+    "https://bds-mtland.com/nha-nha-trang",
     "https://bds-mtland.com",
 ]
 
 ALLOWED_DOMAINS = (
-    "gohomenhatrang.com",
-    "nhatrang4rent.com",
     "nhatrangrenting.com",
+    "nhatrang4rent.com",
     "nhatrangapt.com",
     "nhatrangapartments.com",
     "bds-mtland.com",
@@ -40,7 +41,8 @@ BAD_IMG_TOKENS = (
 SKIP_PATH_TOKENS = (
     "/category", "/categories", "/tag", "/tags", "/author", "/login",
     "/register", "/contact", "/about", "/gioi-thieu", "/lien-he",
-    "/tin-tuc", "/news", "/blog", "/privacy", "/terms", "/search"
+    "/tin-tuc", "/news", "/blog", "/privacy", "/terms", "/search",
+    "/estate-contract/"
 )
 
 
@@ -89,13 +91,21 @@ def _is_ad_detail_url(url: str, source_root: str) -> bool:
     if re.search(r"/(?:page|trang)/\d+$", lower_path):
         return False
 
-    if host == "gohomenhatrang.com":
-        if not path.startswith("/bai-dang/"):
+    if host == "nhatrangrenting.com":
+        return "/properties/" in lower_path
+
+    if host == "bds-mtland.com":
+        if lower_path.startswith("/p/"):
+            slug = path[3:].strip("/")
+            return bool(slug)
+        if "/p/" in lower_path:
+            return True
+        segments = [s for s in path.split("/") if s]
+        if len(segments) == 1 and segments[0].lower() in (
+            "nha-nha-trang", "dat-nha-trang", "can-ho-nha-trang", "san-pham"
+        ):
             return False
-        slug = path[len("/bai-dang/"):].strip("/")
-        if not slug or slug.startswith("page") or slug.startswith("trang"):
-            return False
-        return True
+        return len(segments) >= 1 and (len(segments[-1]) > 12 or re.search(r"\.\d+$", segments[-1]))
 
     segments = [s for s in path.split("/") if s]
     if len(segments) == 1 and segments[0].lower() in (
@@ -163,22 +173,37 @@ def _extract_price(text: str) -> str:
     return "По запросу"
 
 
-def _parse_detail_page(ad_url: str) -> tuple[str, str, list[str]]:
+def _parse_detail_page(ad_url: str, domain: str) -> dict:
+    title = f"Объявление {domain}"
+    price = "По запросу"
+    images = []
     try:
-        resp = requests.get(ad_url, headers=HEADERS, timeout=10)
+        resp = requests.get(ad_url, headers=HEADERS, timeout=6)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
         h1 = soup.find("h1") or soup.find("h2")
-        title = _clean_text(h1.get_text(" ", strip=True)) if h1 else ""
+        if h1:
+            t = _clean_text(h1.get_text(" ", strip=True))
+            if t:
+                title = t
 
         main = soup.find("main") or soup.find("article") or soup
         full_text = _clean_text(main.get_text(" ", strip=True))
         price = _extract_price(full_text)
         images = _extract_images_from_soup(soup, ad_url)
-        return title, price, images
     except Exception:
-        return "", "По запросу", []
+        pass
+
+    return {
+        "id": _make_id(ad_url),
+        "fp": _make_fingerprint(title, price),
+        "source": domain,
+        "title": title[:180],
+        "price": price[:80],
+        "url": ad_url,
+        "images": images,
+    }
 
 
 def _find_next_page_url(soup: BeautifulSoup, current_url: str, visited_pages: set[str]) -> str | None:
@@ -200,7 +225,7 @@ def _find_next_page_url(soup: BeautifulSoup, current_url: str, visited_pages: se
     return None
 
 
-def _scrape_single_source(source_url: str, max_pages: int = 20) -> list[dict]:
+def parse_source(source_url: str, max_pages: int = 5, max_ads: int = 20) -> list[dict]:
     current_url = source_url
     visited_pages = set()
     ad_urls = []
@@ -208,12 +233,12 @@ def _scrape_single_source(source_url: str, max_pages: int = 20) -> list[dict]:
     domain = urlparse(source_url).netloc.lower().removeprefix("www.")
 
     for _ in range(max_pages):
-        if not current_url or current_url in visited_pages:
+        if not current_url or current_url in visited_pages or len(ad_urls) >= max_ads:
             break
         visited_pages.add(current_url)
 
         try:
-            resp = requests.get(current_url, headers=HEADERS, timeout=10)
+            resp = requests.get(current_url, headers=HEADERS, timeout=7)
             if resp.status_code == 404 and current_url != source_url:
                 break
             resp.raise_for_status()
@@ -225,6 +250,8 @@ def _scrape_single_source(source_url: str, max_pages: int = 20) -> list[dict]:
         added_on_page = 0
 
         for a in soup.find_all("a", href=True):
+            if len(ad_urls) >= max_ads:
+                break
             full_href = urljoin(current_url, a["href"].strip()).split("#")[0]
             if _is_ad_detail_url(full_href, source_url):
                 norm_url = _normalize_url(full_href)
@@ -238,37 +265,30 @@ def _scrape_single_source(source_url: str, max_pages: int = 20) -> list[dict]:
             break
         current_url = next_url
 
-    results = []
-    for ad_url in ad_urls:
-        title, price, images = _parse_detail_page(ad_url)
-        if not title:
-            title = f"Объявление {domain}"
-        results.append({
-            "id": _make_id(ad_url),
-            "fp": _make_fingerprint(title, price),
-            "source": domain,
-            "title": title[:180],
-            "price": price[:80],
-            "url": ad_url,
-            "images": images,
-        })
+    if not ad_urls:
+        return []
 
+    results = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_parse_detail_page, u, domain) for u in ad_urls]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception:
+                pass
     return results
 
 
-def parse_gohome(url: str | None = None, max_pages: int = 20) -> list[dict]:
+def parse_gohome(url: str | None = None, max_pages: int = 5) -> list[dict]:
     sources = [url] if url else SOURCES
     all_ads = []
     seen_ids = set()
 
     for src in sources:
-        try:
-            items = _scrape_single_source(src, max_pages=max_pages)
-            for item in items:
-                if item["id"] not in seen_ids:
-                    seen_ids.add(item["id"])
-                    all_ads.append(item)
-        except Exception as e:
-            print(f"Ошибка источника {src}: {e}")
+        items = parse_source(src, max_pages=max_pages)
+        for item in items:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                all_ads.append(item)
 
     return all_ads
