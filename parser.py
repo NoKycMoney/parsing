@@ -24,7 +24,7 @@ RE_VN = [
 ]
 BIKE_VN = [
     "bike_nhatrang", "motohub_nhatrang", "NhaTrang_moto_market", "RentBikeUniq",
-    "BK_rental", "nha_trang_rent", "RentTwentyTwo22NhaTrang", "danang_bike_rent",
+    "BK_rental", "nha_trang_rent", "danang_bike_rent",
     "bikerental1", "viet_sovet",
 ]
 RE_IN = [
