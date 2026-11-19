@@ -6,8 +6,8 @@ from telethon.errors import ChannelPrivateError, ChatAdminRequiredError, FloodWa
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageService
 
-API_ID = int(os.getenv("API_ID", "32726981"))
-API_HASH = os.getenv("API_HASH", "a532b3999366ded30608c2fe66a7621d")
+API_ID = int(os.getenv("API_ID", "37764328"))
+API_HASH = os.getenv("API_HASH", "4d301e4cdd1103e06d6a2c40a8f83a21")
 TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 
 RE_VN = [
